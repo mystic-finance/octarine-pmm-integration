@@ -1,21 +1,22 @@
-# PMM Integration Guide
+# Octarine Liquidity API
 
-Complete guide for integrating Mystic's Private Market Maker (PMM) as a liquidity source in the KyberSwap aggregator.
+Integration guide for sourcing liquidity from Octarine. Written for DEX aggregators, wallets and solvers.
 
+Octarine quotes as a private market maker: a cached price book you poll and cache freely, plus a firm-quote endpoint that returns a signed, executable order.
 
 ## Overview
 
-The PMM exposes two endpoints:
+The API exposes two endpoints:
 
-- **Price Levels**  a cached, two-sided book per chain, polled offline to compute expected amount out. Commits us to nothing.
-- **Firm Quote** signs an executable order against real inventory and returns ready-to-execute calldata.
+- **Price Levels** — a cached, two-sided book per chain, polled offline to compute expected amount out. Commits us to nothing.
+- **Firm Quote** — signs an executable order against real inventory and returns ready-to-execute calldata.
 
-Settlement runs through the **1inch Limit Order Protocol v4**, so no custom verifier contract is needed. The PMM signs an RFQ order; KyberSwap's executor fills it.
+Settlement runs through an on-chain limit-order settlement contract, so no custom verifier contract is needed. Octarine signs an RFQ order; your executor fills it. You never choose the settlement target — the address arrives as `router` on every quote, and the signature is only valid against that contract.
 
 | Property | Value |
 |----------|-------|
-| Base URL | `https://pmm-api.mysticfinance.xyz` |
-| Settlement contract | `0x111111125421cA6dc452d289314280a0f8842A65` (1inch LOP v4) |
+| Base URL | `https://liquidity-api.octarine.finance` |
+| Settlement contract | Per chain — always returned as `router` (currently `0x111111125421cA6dc452d289314280a0f8842A65`) |
 | Quote validity | 120 seconds |
 | Price transport | HTTP polling (WebSocket planned) |
 | Inventory | Held in a Safe; orders signed via EIP-1271 |
@@ -32,8 +33,8 @@ Settlement runs through the **1inch Limit Order Protocol v4**, so no custom veri
 - [What We Need From You](#what-we-need-from-you)
 - [Advanced Implementation Details](#advanced-implementation-details)
 - [API Reference](#api-reference)
-  - [`GET /kyber/v1/prices`](#get-kyberv1prices)
-  - [`POST /kyber/v1/firm`](#post-kyberv1firm)
+  - [`GET /v1/prices`](#get-v1prices)
+  - [`POST /v1/firm`](#post-v1firm)
   - [`GET /health`](#get-health)
 - [Error Codes](#error-codes)
 - [Common Issues](#common-issues)
@@ -43,26 +44,26 @@ Settlement runs through the **1inch Limit Order Protocol v4**, so no custom veri
 ## Integration Flow
 
 ```
-┌────────────────────────────────┐
-│ GET /kyber/v1/prices?chainId=1 │  ← polled every 1-2s, cached by Kyber
-└───────────────┬────────────────┘
+┌──────────────────────────────┐
+│ GET /v1/prices?chainId=1     │  ← poll every 1-2s and cache
+└───────────────┬──────────────┘
                 │
        ┌────────▼─────────┐
-       │ Compute amount   │  ← offline, no call to PMM
+       │ Compute amount   │  ← offline, no call to Octarine
        │ out from levels  │
        └────────┬─────────┘
                 │
          user confirms swap
                 │
-┌───────────────▼────────────────┐
-│ POST /kyber/v1/firm?chainId=1  │  ← once per swap, PMM signs here
-└───────────────┬────────────────┘
+┌───────────────▼──────────────┐
+│ POST /v1/firm?chainId=1      │  ← once per swap, we sign here
+└───────────────┬──────────────┘
                 │
        ┌────────▼──────────┐
        │ code === 0 ?      │
        └───┬───────────┬───┘
            │           │
-          yes          no ──► route around PMM (see Error Codes)
+          yes          no ──► route around Octarine (see Error Codes)
            │
     ┌──────▼──────────────────────┐
     │ Response gives:             │
@@ -84,7 +85,7 @@ Settlement runs through the **1inch Limit Order Protocol v4**, so no custom veri
 
 Field-by-field tables for every request and response are in [API Reference](#api-reference) at the end.
 
-All responses use the standard envelope. **`code: 0` means success**; any non-zero `code` is a  refusal returned with HTTP 200 (not an outage).
+All responses use the standard envelope. **`code: 0` means success**; any non-zero `code` is a business refusal returned with HTTP 200 (not an outage).
 
 ```typescript
 {
@@ -96,7 +97,7 @@ All responses use the standard envelope. **`code: 0` means success**; any non-ze
 
 ### 1. Get Price Levels
 
-**Endpoint:** `GET /kyber/v1/prices?chainId=<id>`
+**Endpoint:** `GET /v1/prices?chainId=<id>`
 
 **Response:**
 ```typescript
@@ -108,8 +109,8 @@ All responses use the standard envelope. **`code: 0` means success**; any non-ze
       // key format: "0x<baseToken>/0x<quoteToken>" (lowercase)
       "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2/0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": {
         last_updated: number;      // unix seconds, fractional
-        bids: Array<[number, number]>;  // PMM BUYS base  — [price, size]
-        asks: Array<[number, number]>;  // PMM SELLS base — [price, size]
+        bids: Array<[number, number]>;  // we BUY base  — [price, size]
+        asks: Array<[number, number]>;  // we SELL base — [price, size]
       }
     }
   }
@@ -119,9 +120,9 @@ All responses use the standard envelope. **`code: 0` means success**; any non-ze
 **Level semantics:**
 
 - `price` is **quote per base**. `size` is denominated in the **base token**.
-- Levels are **exclusive** total tradable depth is the cumulative sum across levels.
+- Levels are **exclusive** — total tradable depth is the cumulative sum across levels.
 - The **first level's size is the minimum trade size**, published as a split level at the same price (e.g. `[[1893.10, 0.005], [1893.10, 16.87], ...]` means a 0.005 minimum).
-- A pair we cannot currently price, stale reference price, or no inventory is **omitted from the response entirely**. It is never published with a zero price or an empty ladder. Absence means "route around us".
+- A pair we cannot currently price — stale reference price, or no inventory — is **omitted from the response entirely**. It is never published with a zero price or an empty ladder. Absence means "route around us".
 
 **Example:**
 ```json
@@ -140,38 +141,38 @@ All responses use the standard envelope. **`code: 0` means success**; any non-ze
 }
 ```
 
-> **Note on one-sided books.** Mystic's inventory is stablecoin-denominated (USDC/AUSD), so the **bid** side carries depth and `asks` may legitimately be empty until fills leave us holding the base token.
+> **Note on one-sided books.** Octarine's inventory is stablecoin-denominated (USDC/AUSD), so the **bid** side carries depth and `asks` may legitimately be empty until fills leave us holding the base token.
 
 ### 2. Request Firm Quote
 
-**Endpoint:** `POST /kyber/v1/firm?chainId=<id>`
+**Endpoint:** `POST /v1/firm?chainId=<id>`
 
 > ### ⚠️ Prerequisites: this endpoint will reject you until both are done
 >
 > Unlike `/prices`, this endpoint hands out signed orders against real inventory, so it is closed by default. Before your first call, send us:
 >
 > **1. Your egress IP addresses / CIDR ranges.**
-> We allowlist them. Any other source gets `HTTP 403` with no response body. Send updates whenever they change, a rotated IP looks identical to an attack from our side.
+> We allowlist them. Any other source gets `HTTP 403` with no response body. Send updates whenever they change — a rotated IP looks identical to an attack from our side.
 >
 > **2. Your executor addresses, per chain.**
-> These are the values you will send as `rfq_sender`. We whitelist them, and every order we sign pins `allowedSender` to that address on-chain. Any `rfq_sender` outside the list is refused with `1009`, regardless of your IP. Currently we whitelisted `0x0F4A1D7FdF4890bE35e71f3E0Bbc4a0EC377eca3` as the `rfq_sender` on our supported chains
+> These are the values you will send as `rfq_sender`. We whitelist them, and every order we sign pins `allowedSender` to that address on-chain. Any `rfq_sender` outside the list is refused with `1009`, regardless of your IP. Currently `0x0F4A1D7FdF4890bE35e71f3E0Bbc4a0EC377eca3` is whitelisted as `rfq_sender` on our supported chains.
 
 **Request:**
 ```typescript
 {
   orders: Array<{
-    maker_asset: string;        // token the PMM provides
-    taker_asset: string;        // token the PMM receives
+    maker_asset: string;        // token we provide
+    taker_asset: string;        // token we receive
     taker_amount: string;       // amount of taker_asset, in wei (decimal string)
     alpha_fee_amount?: string;  // fee to withhold, in wei
     alpha_fee_token?: string;   // defaults to maker_asset; may be taker_asset
   }>;
   allow_partial_success?: boolean;  // default false (all-or-nothing)
   request_id: string;
-  rfq_sender: string;           // KyberSwap executor — REQUIRED, whitelisted
+  rfq_sender: string;           // your executor address — REQUIRED, whitelisted
   recipient?: string;           // where maker asset lands; defaults to rfq_sender
   user_address: string;         // end user, for risk profiling / rate limiting
-  partner?: string;             // e.g. "llamaswap" — drives rate-limit exemptions
+  partner?: string;             // your platform identifier — drives rate-limit exemptions
 }
 ```
 
@@ -191,8 +192,8 @@ All responses use the standard envelope. **`code: 0` means success**; any non-ze
       amountInOffset: number;    // byte offset of amountIn within calldata
     }>;
     expiry: number;              // unix seconds; order is unfillable after this
-    router: string;              // transaction target (1inch LOP v4)
-    maker: string;               // Mystic's Safe address
+    router: string;              // transaction target for this chain
+    maker: string;               // Octarine's Safe address
     taker: string;               // echoes rfq_sender
   }
 }
@@ -226,13 +227,13 @@ All responses use the standard envelope. **`code: 0` means success**; any non-ze
 ## Complete Integration Example
 
 ```typescript
-const PMM_BASE = 'https://pmm-api.mysticfinance.xyz';
+const OCTARINE_BASE = 'https://liquidity-api.octarine.finance';
 
 // ── 1. Poll price levels (cache these; do not call per user) ──────────────
 async function getPrices(chainId: number) {
-  const res = await fetch(`${PMM_BASE}/kyber/v1/prices?chainId=${chainId}`);
+  const res = await fetch(`${OCTARINE_BASE}/v1/prices?chainId=${chainId}`);
   const body = await res.json();
-  if (body.code !== 0) throw new Error(`PMM prices: ${body.message}`);
+  if (body.code !== 0) throw new Error(`Octarine prices: ${body.message}`);
   return body.data.prices;
 }
 
@@ -252,7 +253,7 @@ async function getFirmQuote(chainId: number, params: {
   makerAsset: string; takerAsset: string; takerAmount: string;
   alphaFeeAmount: string; executor: string; userAddress: string;
 }) {
-  const res = await fetch(`${PMM_BASE}/kyber/v1/firm?chainId=${chainId}`, {
+  const res = await fetch(`${OCTARINE_BASE}/v1/firm?chainId=${chainId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -267,14 +268,14 @@ async function getFirmQuote(chainId: number, params: {
       rfq_sender: params.executor,
       recipient: params.executor,
       user_address: params.userAddress,
-      partner: 'kyberswap',
+      partner: 'your-platform',
     }),
   });
 
   const body = await res.json();
   if (body.code !== 0) {
-    // Business refusal, not an outage — route around the PMM.
-    console.warn(`PMM declined (${body.code}): ${body.message}`);
+    // Business refusal, not an outage — route around Octarine.
+    console.warn(`Octarine declined (${body.code}): ${body.message}`);
     return null;
   }
   return body.data;
@@ -305,6 +306,7 @@ To complete the integration we need:
 
 
 1. **Egress IP ranges** for the `/firm` allowlist.
+2. **Executor addresses, per chain** — the values you will send as `rfq_sender`.
 
 ---
 
@@ -317,6 +319,8 @@ Every order pins `allowedSender` to the `rfq_sender` supplied in the request. On
 
 ### 2. Alpha fee handling
 
+Some integrations charge the taker a fee that the market maker custodies and settles offline, rather than transferring on-chain. Send it as `alpha_fee_amount` — omit the field entirely if your integration has no such fee.
+
 The fee is **withheld from the taker's receiving amount**, not transferred separately:
 
 ```
@@ -324,7 +328,7 @@ gross maker amount  = ladder walk at taker_amount
 maker_amount        = gross − alpha_fee_amount
 ```
 
-The difference stays in Mystic's inventory for offline settlement. If `alpha_fee_token` is the taker asset, it is converted to maker-asset terms at that quote's own rate. We record fee token, wei amount, and USD value at signing time for monthly reconciliation.
+The difference stays in Octarine's inventory for offline settlement. If `alpha_fee_token` is the taker asset, it is converted to maker-asset terms at that quote's own rate. We record fee token, wei amount, and USD value at signing time for monthly reconciliation.
 
 ### 3. Expiry
 
@@ -342,10 +346,10 @@ Fills are **pro rata at a fixed rate**: `makerOut = amountIn × signedMaking / s
 
 **Downward → always works, costs you nothing.** On a multi-hop route our leg's input is the previous hop's on-chain output, so the exact figure is only known at execution. Write the real amount in and you receive proportionally less at the same rate.
 
-**Upward → supported up to 1%.** We sign each order with 1% headroom on both legs, so a previous-hop estimate that lands slightly high still fills. Beyond that the order is not large enough and the fill revert, request a fresh quote at the larger size.
+**Upward → supported up to 1%.** We sign each order with 1% headroom on both legs, so a previous-hop estimate that lands slightly high still fills. Beyond that the order is not large enough and the fill reverts — request a fresh quote at the larger size.
 
 ```
-route:  USDC ──[Uniswap]──> WETH ──[Mystic PMM]──> LINK
+route:  USDC ──[Uniswap]──> WETH ──[Octarine]──> LINK
 
   request firm quote for 1.000 WETH
     ├─ delivered 0.994 → patch amountIn to 0.994e18 → fills at the quoted rate
@@ -353,7 +357,7 @@ route:  USDC ──[Uniswap]──> WETH ──[Mystic PMM]──> LINK
     └─ delivered 1.050 → exceeds headroom → re-quote
 ```
 
-To keep corrections small, **request the amount your route simulation expects the previous hop to deliver**, rather than its minimum, you already compute that number when building the route. If your slippage tolerance means corrections regularly exceed 1%, tell us and we will raise the headroom to match.
+To keep corrections small, **request the amount your route simulation expects the previous hop to deliver**, rather than its minimum — you already compute that number when building the route. If your slippage tolerance means corrections regularly exceed 1%, tell us and we will raise the headroom to match.
 
 #### How to patch
 
@@ -378,7 +382,7 @@ const calldata = actualAmountIn
 
 #### Reading the offset
 
-Never hardcode it, the value depends on which fill entrypoint the order uses. It is computed per-order and will follow any future change in maker configuration, so read it from the response every time.
+Never hardcode it — the value depends on which fill entrypoint the order uses. It is computed per-order and will follow any future change in maker configuration, so read it from the response every time.
 
 The order can be filled **once**, at any amount up to the signed size.
 
@@ -386,7 +390,7 @@ The order can be filled **once**, at any amount up to the signed size.
 
 ## API Reference
 
-Base URL `https://pmm-api.mysticfinance.xyz`. Every `/kyber/v1` response is wrapped in the envelope below; `/health` is not.
+Base URL `https://liquidity-api.octarine.finance`. Every `/v1` response is wrapped in the envelope below; `/health` is not.
 
 | Field | Type | Description |
 |---|---|---|
@@ -394,7 +398,7 @@ Base URL `https://pmm-api.mysticfinance.xyz`. Every `/kyber/v1` response is wrap
 | `message` | string | Human-readable reason. Log it; it names the failing leg. |
 | `data` | object | Present only when `code` is `0`. Shape per endpoint below. |
 
-### `GET /kyber/v1/prices`
+### `GET /v1/prices`
 
 The two-sided book for one chain. Poll it every 1–2s and cache — never call it per user. Reads in-memory state only, no allowlist, commits us to nothing.
 
@@ -415,14 +419,14 @@ The two-sided book for one chain. Poll it every 1–2s and cache — never call 
 | Field | Type | Description |
 |---|---|---|
 | `last_updated` | number | Unix seconds, fractional. When the reference price behind this ladder was observed — not when you fetched it. Older than ~10s means we are about to drop the pair. |
-| `bids` | `[price, size][]` | Levels where the **PMM buys the base** and pays quote. |
-| `asks` | `[price, size][]` | Levels where the **PMM sells the base** and receives quote. Legitimately `[]` — our inventory is stablecoin-denominated. |
+| `bids` | `[price, size][]` | Levels where **we buy the base** and pay quote. |
+| `asks` | `[price, size][]` | Levels where **we sell the base** and receive quote. Legitimately `[]` — our inventory is stablecoin-denominated. |
 | `price` | number | Quote per base, decimal-adjusted. Not wei. |
 | `size` | number | Depth **at that level**, denominated in the **base token**. Levels are exclusive: total depth is the cumulative sum. |
 
 The first level is the **minimum trade size**, published as a split at the same price — `[[1893.10, 0.005], [1893.10, 16.87]]` means a 0.005 base minimum and 16.875 total at that price.
 
-### `POST /kyber/v1/firm`
+### `POST /v1/firm`
 
 Signs an executable order against reserved inventory. One call per swap, at confirmation time. Gated by an **IP allowlist** (`403`, empty body) and an **executor whitelist** (`1009`) — see [Prerequisites](#2-request-firm-quote).
 
@@ -442,14 +446,14 @@ Signs an executable order against reserved inventory. One call per swap, at conf
 | `user_address` | string | ✅ | The end user. Used for risk profiling and rate limiting only; never appears on-chain. |
 | `recipient` | string | — | Where the maker asset lands. Defaults to `rfq_sender`. |
 | `allow_partial_success` | boolean | — | Default `false` (all-or-nothing: one bad leg fails the batch and every reservation is released). `true` returns whatever priced. |
-| `partner` | string | — | Meta-aggregator identifier, e.g. `"kyberswap"`. Drives rate-limit exemptions. |
+| `partner` | string | — | Your platform identifier. Drives rate-limit exemptions. |
 
 **Request — `orders[]`**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `maker_asset` | string | ✅ | Token the **PMM provides** — what the user receives. |
-| `taker_asset` | string | ✅ | Token the **PMM receives** — what the user sells. |
+| `maker_asset` | string | ✅ | Token **we provide** — what the user receives. |
+| `taker_asset` | string | ✅ | Token **we receive** — what the user sells. |
 | `taker_amount` | string | ✅ | Amount of `taker_asset`, in **wei as a decimal string**. Anything non-decimal is a `400`. |
 | `alpha_fee_amount` | string | — | Fee to withhold, in wei. Taken **out of the maker amount**, not transferred separately. |
 | `alpha_fee_token` | string | — | Token the fee is denominated in. Defaults to `maker_asset`; may be `taker_asset`, converted at that quote's own rate. |
@@ -460,8 +464,8 @@ Signs an executable order against reserved inventory. One call per swap, at conf
 |---|---|---|
 | `orders` | array | One entry per **successfully priced** leg, in request order. Under `allow_partial_success` refused legs are simply absent with no placeholder — match by the asset pair, not by index. |
 | `expiry` | integer | Unix seconds. Enforced on-chain: broadcasting after this reverts. 120s from signing. |
-| `router` | string | Transaction target — the 1inch LOP v4 on this chain. Send `calldata` here. |
-| `maker` | string | Mystic's Safe. Signs via EIP-1271. |
+| `router` | string | Transaction target on this chain — the settlement contract the order is signed against. Send `calldata` here; it is not fillable anywhere else. |
+| `maker` | string | Octarine's Safe. Signs via EIP-1271. |
 | `taker` | string | Echoes `rfq_sender`, so you can assert the order came back locked to your executor. |
 
 **Response — `orders[]`**
@@ -479,12 +483,12 @@ Each order is fillable **once**.
 
 ### `GET /health`
 
-Operational state. Not enveloped — fields are top-level. `"up"` is the wrong question for a PMM: the process can be healthy while quoting nothing, so **`quotablePairs` is the number worth alerting on**.
+Operational state. Not enveloped — fields are top-level. `"up"` is the wrong question for a market maker: the process can be healthy while quoting nothing, so **`quotablePairs` is the number worth alerting on**.
 
 | Field | Type | Description |
 |---|---|---|
 | `status` | string | `ok` when any pair is quotable anywhere, else `degraded`. |
-| `quotingDisabled` | boolean | `true` means we have deliberately paused; `/firm` returns `1007`. |
+| `quotingDisabled` | boolean | `true` means we have deliberately paused; `/v1/firm` returns `1007`. |
 | `mockInventoryEnabled` | boolean | **`true` means the book is simulated.** Quotes are real and signed but fills revert — staging only, never production. |
 | `maker` | string | The Safe orders are signed for. |
 | `quoteTtlSeconds` | integer | Quote validity, currently `120`. |
@@ -504,13 +508,13 @@ All returned as HTTP 200 with a non-zero `code`.
 | Code | Meaning | Recommended action |
 |------|---------|--------------------|
 | `0` | Success | Proceed |
-| `1001` | Unsupported chain | Do not route to PMM on this chain |
+| `1001` | Unsupported chain | Do not route to Octarine on this chain |
 | `1002` | Unsupported pair | Do not route this pair |
 | `1003` | Insufficient liquidity | Reduce size or route elsewhere |
-| `1004` | Stale price | Retry shortly; PMM has no fresh reference |
+| `1004` | Stale price | Retry shortly; no fresh reference price |
 | `1005` | Rate limited | Back off; see rate limits below |
 | `1006` | Notional cap exceeded | Reduce size |
-| `1007` | Quoting disabled | PMM is paused; skip until prices return |
+| `1007` | Quoting disabled | Quoting is paused; skip until prices return |
 | `1008` | Invalid alpha fee | Fee ≥ maker amount, or unknown fee token |
 | `1009` | Unauthorised `rfq_sender` | Executor not whitelisted — contact us |
 | `1500` | Internal error | Retry or route elsewhere |
@@ -520,7 +524,7 @@ HTTP-level responses:
 | Status | Meaning |
 |--------|---------|
 | `400` | Malformed request (bad address, non-decimal wei string, missing `chainId`) |
-| `403` | Caller IP not in allowlist (`/firm` only) |
+| `403` | Caller IP not in allowlist (`/v1/firm` only) |
 
 ---
 
@@ -532,22 +536,23 @@ HTTP-level responses:
 - Reference price is stale (> 10s old)
 - Pair not configured on that chain
 
-**Solution:** Treat absence as "PMM has no liquidity right now" and route around us. It is not an error state.
+**Solution:** Treat absence as "Octarine has no liquidity right now" and route around us. It is not an error state.
 
 ### Issue: `asks` array is empty
-**Cause:** Mystic's inventory is stablecoin-denominated, so we quote the **bid** side (buying the volatile token, paying stable). Asks populate only once fills leave us holding the base token.
+**Cause:** Octarine's inventory is stablecoin-denominated, so we quote the **bid** side (buying the volatile token, paying stable). Asks populate only once fills leave us holding the base token.
 
-**Solution:** This is expected behaviour, not a fault. Note that ask-only test tooling will need base-side inventory seeded first — tell us before running the acceptance test and we will fund both sides.
+**Solution:** This is expected behaviour, not a fault. Test tooling that exercises only one direction will need inventory seeded on that side first — tell us before running an acceptance test and we will fund both sides.
 
 ### Issue: "Transaction reverted"
 **Causes:**
 - Quote expired → request a fresh quote (120s validity)
-- `amountIn` scaled **up by more than 1%** → beyond the signed headroom; re-quote at the larger size (see Key Implementation Details §1)
+- `amountIn` scaled **up by more than 1%** → beyond the signed headroom; re-quote at the larger size (see [Advanced Implementation Details §4](#4-patching-amountin-and-reading-amountinoffset))
 - Caller is not `rfq_sender` → the order is locked to that address
+- Calldata sent to a target other than the returned `router` → the signature is only valid against that contract
 - Order already filled → single-fill only
 
 ### Issue: Quote succeeds but the fill reverts
-**Cause:** During early integration our staging PMM may publish **simulated depth** so the book is non-empty before the Safe is funded. Quotes are real and signed, but the maker cannot deliver, so fills revert.
+**Cause:** During early integration our staging environment may publish **simulated depth** so the book is non-empty before the Safe is funded. Quotes are real and signed, but the maker cannot deliver, so fills revert.
 
 **How to tell:** `GET /health` reports `"mockInventoryEnabled": true`, and each affected inventory row is flagged `"mocked": true`.
 
@@ -560,4 +565,3 @@ HTTP-level responses:
 **Solution:** Your egress IPs are not in our allowlist. Send us the current list.
 
 ---
-
