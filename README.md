@@ -278,11 +278,50 @@ async function execute(quote, actualAmountIn?: bigint) {
 
 ---
 
-## Key Implementation Details
+## API Endpoints Summary
 
-### 1. Patching `amountIn`, and reading `amountInOffset`
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/kyber/v1/prices?chainId=<id>` | GET | Fetch price levels for a chain |
+| `/kyber/v1/firm?chainId=<id>` | POST | Request a signed, executable quote |
+| `/health` | GET | Quoting status, per-chain quotable pair count |
 
-The integration example above executes the calldata exactly as returned, which is correct for the common case. This section covers when you need to change it, and how.
+---
+
+## What We Need From You
+
+To complete the integration we need:
+
+
+1. **Egress IP ranges** for the `/firm` allowlist.
+
+---
+
+
+## Advanced Implementation Details
+
+### 1. `rfq_sender` is enforced on-chain
+
+Every order pins `allowedSender` to the `rfq_sender` supplied in the request. Only that address can fill it. `rfq_sender` must also appear in our configured executor whitelist or the request is refused with `1009` — see [What We Need From You](#what-we-need-from-you).
+
+### 2. Alpha fee handling
+
+The fee is **withheld from the taker's receiving amount**, not transferred separately:
+
+```
+gross maker amount  = ladder walk at taker_amount
+maker_amount        = gross − alpha_fee_amount
+```
+
+The difference stays in Mystic's inventory for offline settlement. If `alpha_fee_token` is the taker asset, it is converted to maker-asset terms at that quote's own rate. We record fee token, wei amount, and USD value at signing time for monthly reconciliation.
+
+### 3. Expiry
+
+Orders are valid for **120 seconds** and enforce expiry on-chain. Requesting a quote significantly ahead of broadcast will produce reverts.
+
+### 4. Patching `amountIn`, and reading `amountInOffset`
+
+The integration example above executes the calldata exactly as returned, which is correct for the common case. This section covers when you need to change it due to the output of a chained swap, and how.
 
 #### When you need to patch
 
@@ -328,54 +367,9 @@ const calldata = actualAmountIn
 
 #### Reading the offset
 
-Never hardcode it, the value depends on which fill entrypoint the order uses:
-
-| Maker type | Entrypoint | `amountInOffset` |
-|------------|-----------|------------------|
-| EOA | `fillOrderArgs` | 324 |
-| Safe (current) | `fillContractOrderArgs` | 292 |
-
-It is computed per-order and will follow any future change in maker configuration, so read it from the response every time.
+Never hardcode it, the value depends on which fill entrypoint the order uses. It is computed per-order and will follow any future change in maker configuration, so read it from the response every time.
 
 The order can be filled **once**, at any amount up to the signed size.
-
-### 2. `rfq_sender` is enforced on-chain
-
-Every order pins `allowedSender` to the `rfq_sender` supplied in the request. Only that address can fill it. `rfq_sender` must also appear in our configured executor whitelist or the request is refused with `1009` — see [What We Need From You](#what-we-need-from-you).
-
-### 3. Alpha fee handling
-
-The fee is **withheld from the taker's receiving amount**, not transferred separately:
-
-```
-gross maker amount  = ladder walk at taker_amount
-maker_amount        = gross − alpha_fee_amount
-```
-
-The difference stays in Mystic's inventory for offline settlement. If `alpha_fee_token` is the taker asset, it is converted to maker-asset terms at that quote's own rate. We record fee token, wei amount, and USD value at signing time for monthly reconciliation.
-
-### 4. Expiry
-
-Orders are valid for **120 seconds** and enforce expiry on-chain. Requesting a quote significantly ahead of broadcast will produce reverts.
-
----
-
-## API Endpoints Summary
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/kyber/v1/prices?chainId=<id>` | GET | Fetch price levels for a chain |
-| `/kyber/v1/firm?chainId=<id>` | POST | Request a signed, executable quote |
-| `/health` | GET | Quoting status, per-chain quotable pair count |
-
----
-
-## What We Need From You
-
-To complete the integration we need:
-
-
-1. **Egress IP ranges** for the `/firm` allowlist.
 
 ---
 
